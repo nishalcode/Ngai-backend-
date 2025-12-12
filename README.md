@@ -1,6 +1,6 @@
 <h1 align="center">
   <br>
-  <strong>🔥 NGAI CHATBOT BACKEND 🔥</strong>
+  <strong>🔥NGAI BACKEND🔥</strong>
   <br>
   <br>
 </h1>
