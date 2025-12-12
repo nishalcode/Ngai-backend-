@@ -1,17 +1,8 @@
-// server.js
-// NGAI-ready SSE backend — fixes:
-// 1) Use standard "Referer" header for OpenRouter
-// 2) Clean up sessions after use (no memory leak)
-// 3) Robust JSON parsing for malformed chunks
-// 4) Proper SSE formatting for [DONE] (always `data:` lines)
-//
-// Requirements: Node 18+ (global fetch), npm install express cors dotenv
-// .env: OPENROUTER_API_KEY, OPTIONAL: REFERER (defaults to client's origin or fallback)
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
+
 dotenv.config();
 
 const app = express();
@@ -22,6 +13,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
 app.use(express.json({ limit: "1mb" }));
 
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
@@ -30,28 +22,64 @@ if (!OPENROUTER_KEY) {
   process.exit(1);
 }
 
-// In-memory sessions (small, ephemeral). Swap to Redis for production.
+// In-memory session store
 const sessions = {};
 
-// SSE helpers — ALWAYS use `data:` lines
+// SSE helpers
 function initSSE(res) {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-store, no-transform");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
-  // send a comment to prime the connection (keeps some proxies awake)
   res.write(`: ping\n\n`);
 }
 
 function sendSSE(res, event, payload) {
   if (event) res.write(`event: ${event}\n`);
   const data = typeof payload === "string" ? payload : JSON.stringify(payload);
-  // ensure newline-safe data lines
   res.write(`data: ${data}\n\n`);
 }
 
-// ------------- Step 1: create session -------------
+// Clean session
+function cleanSession(id) {
+  if (sessions[id]) delete sessions[id];
+}
+
+// ----------------- ROUTES -----------------
+
+// Root status page
+app.get("/", (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>NGAI Backend Status</title>
+      <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+        h1 { color: #333; }
+        .status { color: green; font-size: 1.2em; margin: 20px; }
+        .endpoints { text-align: left; display: inline-block; margin-top: 30px; }
+      </style>
+    </head>
+    <body>
+      <h1>🚀 NGAI Chatbot Backend</h1>
+      <div class="status">✅ Server is running and healthy</div>
+      <div class="endpoints">
+        <h3>Available Endpoints:</h3>
+        <ul>
+          <li><strong>POST /prepare</strong> - Create chat session</li>
+          <li><strong>GET /stream/:sessionId</strong> - SSE stream</li>
+          <li><strong>GET /models</strong> - List AI models</li>
+        </ul>
+        <p><em>Use the test HTML file to interact with the API</em></p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// Prepare session
 app.post("/prepare", (req, res) => {
   const { model, messages } = req.body;
   if (!model || !messages) return res.status(400).json({ error: "model & messages required" });
@@ -61,28 +89,26 @@ app.post("/prepare", (req, res) => {
   return res.json({ sessionId });
 });
 
-// ------------- Step 2: SSE stream for session -------------
+// SSE stream route
 app.get("/stream/:sessionId", async (req, res) => {
   initSSE(res);
 
   const sessionId = req.params.sessionId;
   const session = sessions[sessionId];
   if (!session) {
-    sendSSE(res, "error", { message: "invalid sessionId" });
+    sendSSE(res, "error", { message: "Invalid sessionId" });
     res.end();
     return;
   }
 
-  // derive a Referer header: env override -> client's origin header -> fallback
   const refererValue = process.env.REFERER || req.headers.origin || "https://your-domain.com";
+  const xTitleValue = process.env.X_TITLE || "NGAI Chatbot Backend";
 
-  const upstreamHeaders = {
+  const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${OPENROUTER_KEY}`,
-    // Standard header name is "Referer"
     Referer: refererValue,
-    // OpenRouter also expects an X-Title meta header (kept as-is)
-    "X-Title": process.env.X_TITLE || "NGAI Chatbot Backend",
+    "X-Title": xTitleValue,
   };
 
   const body = {
@@ -95,13 +121,13 @@ app.get("/stream/:sessionId", async (req, res) => {
   try {
     const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: upstreamHeaders,
+      headers,
       body: JSON.stringify(body),
     });
 
     if (!upstream.ok) {
       const text = await upstream.text();
-      sendSSE(res, "error", { message: "openrouter error", status: upstream.status, body: text });
+      sendSSE(res, "error", { message: "OpenRouter error", status: upstream.status, body: text });
       cleanSession(sessionId);
       res.end();
       return;
@@ -109,7 +135,7 @@ app.get("/stream/:sessionId", async (req, res) => {
 
     reader = upstream.body.getReader();
   } catch (err) {
-    sendSSE(res, "error", { message: "failed to connect to OpenRouter", detail: err.message });
+    sendSSE(res, "error", { message: "Failed to connect to OpenRouter", detail: err.message });
     cleanSession(sessionId);
     res.end();
     return;
@@ -118,71 +144,87 @@ app.get("/stream/:sessionId", async (req, res) => {
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
-  // Ensure we cancel reader & cleanup if client disconnects
-  const onClientClose = () => {
-    try { reader?.cancel(); } catch (e) {}
+  // Cleanup only on client disconnect
+  req.on("close", () => {
+    try { reader?.cancel(); } catch {}
     cleanSession(sessionId);
-  };
-  req.on("close", onClientClose);
-  req.on("end", onClientClose);
+  });
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
 
-      // OpenRouter streaming often sends multiple data blocks separated by \n\n
-      // We parse all complete blocks; leave remainder in buffer
+      buffer += decoder.decode(value, { stream: true });
       const blocks = buffer.split("\n\n");
       buffer = blocks.pop();
 
-      for (let rawBlock of blocks) {
-        if (!rawBlock) continue;
+      for (let block of blocks) {
+        if (!block.trim()) continue;
 
-        // Normalize: any leading "data:" lines -> extract every data: line
-        const lines = rawBlock.split("\n").map((l) => l.trim()).filter(Boolean);
-
-        // iterate lines starting with "data:"
+        const lines = block.split("\n").map(l => l.trim()).filter(Boolean);
         for (const line of lines) {
           if (!line.startsWith("data:")) continue;
+
           const payloadRaw = line.replace(/^data:\s*/, "");
 
-          // EXACT SSE DONE handling: OpenRouter may send "[DONE]" as a data payload
           if (payloadRaw === "[DONE]" || payloadRaw === '"[DONE]"') {
-            // send DONE as SSE data line (and a done event)
             sendSSE(res, "done", "[DONE]");
-            // cleanup and close
             try { reader.cancel(); } catch {}
             cleanSession(sessionId);
             res.end();
             return;
           }
 
-          // Attempt to parse JSON safely. If parsing fails, emit the raw string as chunk.
           try {
-            const json = JSON.parse(payloadRaw);
-            sendSSE(res, "chunk", json);
-          } catch (parseErr) {
-            // Malformed JSON chunk — don't crash; forward raw text for client debugging
-            sendSSE(res, "chunk", { raw: payloadRaw, parseError: parseErr.message });
+            const data = JSON.parse(payloadRaw);
+            let content = "";
+            let shouldEnd = false;
+
+            if (data.choices?.[0]?.delta?.content !== undefined) {
+              content = (data.choices[0].delta.content || "").trim();
+            }
+            if (data.choices?.[0]?.message?.content !== undefined) {
+              content = (data.choices[0].message.content || "").trim();
+            }
+            if (data.choices?.[0]?.text !== undefined) {
+              content = (data.choices[0].text || "").trim();
+            }
+
+            if (data.choices?.[0]?.finish_reason) {
+              shouldEnd = true;
+            }
+
+            if (content.length > 0) {
+              sendSSE(res, "chunk", { content });
+            }
+
+            if (shouldEnd) {
+              sendSSE(res, "done", "[DONE]");
+              try { reader.cancel(); } catch {}
+              cleanSession(sessionId);
+              res.end();
+              return;
+            }
+
+          } catch {
+            sendSSE(res, "chunk", payloadRaw);
           }
         }
       }
     }
 
-    // Stream naturally ended; signal DONE properly
     sendSSE(res, "done", "[DONE]");
+
   } catch (err) {
-    // handle stream errors gracefully
-    sendSSE(res, "error", { message: "stream error", detail: err.message });
+    sendSSE(res, "error", { message: "Stream error", detail: err.message });
   } finally {
     cleanSession(sessionId);
-    try { res.end(); } catch (e) {}
+    try { res.end(); } catch {}
   }
 });
 
-// Simple models endpoint that forwards OpenRouter model list (optional)
+// List models
 app.get("/models", async (req, res) => {
   try {
     const r = await fetch("https://openrouter.ai/api/v1/models", {
@@ -195,25 +237,15 @@ app.get("/models", async (req, res) => {
   }
 });
 
-// Health
-app.get("/", (req, res) => res.send("NGAI SSE backend alive"));
-
-// Session cleanup helper
-function cleanSession(sessionId) {
-  if (sessionId && sessions[sessionId]) {
-    delete sessions[sessionId];
-  }
-}
-
-// Optional: periodic sweeper to remove old sessions (defensive)
+// Optional session sweeper
 setInterval(() => {
   const now = Date.now();
   for (const id of Object.keys(sessions)) {
-    if (now - sessions[id].createdAt > 1000 * 60 * 10) { // 10 minutes
+    if (now - sessions[id].createdAt > 1000 * 60 * 10) {
       delete sessions[id];
     }
   }
-}, 1000 * 60 * 5); // run every 5 minutes
+}, 1000 * 60 * 5);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 NGAI SSE backend running on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 NGAI SSE backend running on port ${PORT}`));
