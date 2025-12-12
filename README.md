@@ -1,4 +1,11 @@
-##NGAI Chatbot Backend
+<h1 align="center">
+  <br>
+  <strong>🔥 NGAI CHATBOT BACKEND 🔥</strong>
+  <br>
+  <br>
+</h1>
+
+<h3 align="center">Production-Ready SSE Streaming Backend for AI Chatbots</h3>
 
 A production-ready SSE (Server-Sent Events) streaming backend for AI chatbots using OpenRouter's free models. Features real-time streaming, session management, and robust error handling.
 
